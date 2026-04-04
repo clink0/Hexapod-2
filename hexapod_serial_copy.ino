@@ -929,8 +929,9 @@ void auto_navigate()
           }
         }
 
-        // Smooth over a 3-slot (45°) window; find slot with lowest total certainty
-        float best_score = 1e9;
+        // Smooth over a 3-slot (45°) window; find slot with lowest total certainty.
+        // Seed with the forward slot (6) so ties always prefer going straight.
+        float best_score = hist[5] + hist[6] + hist[7];
         int   best_slot  = 6;
         for(int i = 1; i <= 11; i++) {
           float score = hist[i-1] + hist[i] + hist[i+1];
