@@ -19,7 +19,7 @@
 // Serial Command Reference:
 //
 //  MODE <n>     - Set mode: 0=idle, 1=walk, 2=translate, 3=rotate,
-//                           4=one_leg_lift, 5=scan, 6=navigate, 99=set_all_90
+//                           4=one_leg_lift, 5=scan, 6=navigate, 7=sensor_cal, 99=set_all_90
 //  GAIT <n>     - Select gait: 0=tripod, 1=wave, 2=ripple, 3=tetrapod
 //                 (also stops movement and resets position)
 //  SPEED <n>    - Set gait speed: 0=fast, 1=slow
@@ -169,6 +169,14 @@ int auto_phase;                       //navigate mode variables
 int auto_timer;
 int auto_scan_min_right;
 int auto_scan_min_left;
+
+int sensor_right_offset = 0;         //calibration offset applied to right sensor in navigate mode
+int cal_count;                        //calibration mode variables
+long cal_sum_left;
+long cal_sum_right;
+int cal_valid_left;
+int cal_valid_right;
+const int CAL_SAMPLES = 50;
 int vfh_left[7];                      // distances at 90°,75°,60°,45°,30°,15°,0° (left side)
 int vfh_right[7];                     // distances at 90°,75°,60°,45°,30°,15°,0° (right side)
 int auto_turn_dir;                    //-1=turn left, 0=straight, 1=turn right
@@ -341,6 +349,7 @@ void loop()
     if(mode == 4) one_leg_lift();
     if(mode == 5) scan_mode();
     if(mode == 6) auto_navigate();
+    if(mode == 7) calibrate_sensors();
     if(mode == 99) set_all_90();
   }
 }
@@ -386,6 +395,13 @@ void parse_command(String cmd)
       memset(vfh_left,  0, sizeof(vfh_left));
       memset(vfh_right, 0, sizeof(vfh_right));
       int t[6] = {1,2,1,2,1,2}; memcpy(tripod_case, t, sizeof(t));
+    }
+    if(mode == 7) {
+      cal_count = 0; cal_sum_left = 0; cal_sum_right = 0;
+      cal_valid_left = 0; cal_valid_right = 0;
+      Serial.println("CAL_START");
+      Serial.print("Taking "); Serial.print(CAL_SAMPLES); Serial.println(" readings from each sensor.");
+      Serial.println("Place both sensors the same distance from a flat surface.");
     }
     Serial.print("OK MODE "); Serial.println(mode);
   }
@@ -873,6 +889,7 @@ void auto_navigate()
          scan_tick == 66 || scan_tick == 83 || scan_tick == SCAN_SWEEP_TICKS-1) {
         int vfh_idx = (int)((float)scan_tick / (SCAN_SWEEP_TICKS-1) * 6.0 + 0.5);
         dist = read_ultrasonic(TRIG_RIGHT, ECHO_RIGHT);
+        if(dist > 0) dist = constrain(dist + sensor_right_offset, 1, 9999);
         vfh_right[vfh_idx] = dist;
         Serial.print("SCAN_R "); Serial.print(int(degrees(sweep_angle))); Serial.print(" "); Serial.println(dist);
       }
@@ -998,6 +1015,53 @@ void auto_navigate()
       }
       break;
   }
+}
+
+void calibrate_sensors()
+{
+  // Hold home position — all legs stay put, no gait running
+  for(int ln = 0; ln < 6; ln++)
+  {
+    current_X[ln] = HOME_X[ln];
+    current_Y[ln] = HOME_Y[ln];
+    current_Z[ln] = HOME_Z[ln];
+  }
+
+  if(cal_count >= CAL_SAMPLES)
+  {
+    // Compute averages (only over valid readings)
+    int avg_left  = (cal_valid_left  > 0) ? (int)(cal_sum_left  / cal_valid_left)  : -1;
+    int avg_right = (cal_valid_right > 0) ? (int)(cal_sum_right / cal_valid_right) : -1;
+
+    Serial.println("CAL_DONE");
+    Serial.print("CAL_AVG_L "); Serial.println(avg_left);
+    Serial.print("CAL_AVG_R "); Serial.println(avg_right);
+
+    if(avg_left > 0 && avg_right > 0)
+    {
+      sensor_right_offset = avg_left - avg_right;
+      Serial.print("CAL_OFFSET_R "); Serial.println(sensor_right_offset);
+      Serial.println("Right sensor offset saved. Navigate mode will apply it automatically.");
+    }
+    else
+    {
+      Serial.println("CAL_ERROR: one or both sensors returned no valid readings.");
+    }
+
+    mode = 0;
+    return;
+  }
+
+  int dist_left  = read_ultrasonic(TRIG_LEFT,  ECHO_LEFT);
+  int dist_right = read_ultrasonic(TRIG_RIGHT, ECHO_RIGHT);
+
+  if(dist_left  > 0) { cal_sum_left  += dist_left;  cal_valid_left++; }
+  if(dist_right > 0) { cal_sum_right += dist_right; cal_valid_right++; }
+
+  Serial.print("CAL_L "); Serial.print(cal_count); Serial.print(" "); Serial.println(dist_left);
+  Serial.print("CAL_R "); Serial.print(cal_count); Serial.print(" "); Serial.println(dist_right);
+
+  cal_count++;
 }
 
 // Returns distance in mm, or -1 on timeout (no echo within ~2.5m)
