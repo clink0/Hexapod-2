@@ -1019,13 +1019,18 @@ void auto_navigate()
 
 void calibrate_sensors()
 {
-  // Hold home position — all legs stay put, no gait running
+  // Tall stance with both front legs (0 and 5) at their 0-degree scan position:
+  // X=SCAN_RADIUS, Y=0, Z=SCAN_RAISED_Z — exactly where the sweep ends pointing forward.
+  // Support legs use SCAN_STANCE_Z (same as navigate mode).
   for(int ln = 0; ln < 6; ln++)
   {
     current_X[ln] = HOME_X[ln];
     current_Y[ln] = HOME_Y[ln];
-    current_Z[ln] = HOME_Z[ln];
+    current_Z[ln] = SCAN_STANCE_Z;
   }
+  // Front-right leg (0) and front-left leg (5) point straight forward
+  current_X[0] = SCAN_RADIUS;  current_Y[0] = 0.0;  current_Z[0] = SCAN_RAISED_Z;
+  current_X[5] = SCAN_RADIUS;  current_Y[5] = 0.0;  current_Z[5] = SCAN_RAISED_Z;
 
   if(cal_count >= CAL_SAMPLES)
   {
