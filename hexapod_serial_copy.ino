@@ -171,12 +171,7 @@ int auto_scan_min_right;
 int auto_scan_min_left;
 
 int sensor_right_offset = 0;         //calibration offset applied to right sensor in navigate mode
-int cal_count;                        //calibration mode variables
-long cal_sum_left;
-long cal_sum_right;
-int cal_valid_left;
-int cal_valid_right;
-const int CAL_SAMPLES = 50;
+int cal_count;                        //0 = burst not yet run, 1 = done
 int vfh_left[7];                      // distances at 90°,75°,60°,45°,30°,15°,0° (left side)
 int vfh_right[7];                     // distances at 90°,75°,60°,45°,30°,15°,0° (right side)
 int auto_turn_dir;                    //-1=turn left, 0=straight, 1=turn right
@@ -397,11 +392,8 @@ void parse_command(String cmd)
       int t[6] = {1,2,1,2,1,2}; memcpy(tripod_case, t, sizeof(t));
     }
     if(mode == 7) {
-      cal_count = 0; cal_sum_left = 0; cal_sum_right = 0;
-      cal_valid_left = 0; cal_valid_right = 0;
-      Serial.println("CAL_START");
-      Serial.print("Taking "); Serial.print(CAL_SAMPLES); Serial.println(" readings from each sensor.");
-      Serial.println("Place both sensors the same distance from a flat surface.");
+      cal_count = 0;
+      Serial.println("CAL_START — place both sensors the same distance from a flat surface.");
     }
     Serial.print("OK MODE "); Serial.println(mode);
   }
@@ -1029,45 +1021,54 @@ void calibrate_sensors()
     current_Y[ln] = HOME_Y[ln];
     current_Z[ln] = SCAN_STANCE_Z;
   }
-  // Front-right leg (0) and front-left leg (5) point straight forward
   current_X[0] = SCAN_RADIUS;  current_Y[0] = 0.0;  current_Z[0] = SCAN_RAISED_Z;
   current_X[5] = SCAN_RADIUS;  current_Y[5] = 0.0;  current_Z[5] = SCAN_RAISED_Z;
 
-  if(cal_count >= CAL_SAMPLES)
+  if(cal_count > 0) return;   // burst already completed, waiting for mode to reset
+  cal_count = 1;              // mark as running so we only burst once
+
+  // Take 20 readings per sensor; discard first 10 (settling), average last 10.
+  const int BURST = 20;
+  const int SKIP  = 10;
+  long sum_l = 0, sum_r = 0;
+  int  valid_l = 0, valid_r = 0;
+
+  for(int n = 0; n < BURST; n++)
   {
-    // Compute averages (only over valid readings)
-    int avg_left  = (cal_valid_left  > 0) ? (int)(cal_sum_left  / cal_valid_left)  : -1;
-    int avg_right = (cal_valid_right > 0) ? (int)(cal_sum_right / cal_valid_right) : -1;
+    int dl = read_ultrasonic(TRIG_LEFT,  ECHO_LEFT);
+    int dr = read_ultrasonic(TRIG_RIGHT, ECHO_RIGHT);
 
-    Serial.println("CAL_DONE");
-    Serial.print("CAL_AVG_L "); Serial.println(avg_left);
-    Serial.print("CAL_AVG_R "); Serial.println(avg_right);
+    Serial.print("CAL_L "); Serial.print(n); Serial.print(" "); Serial.println(dl);
+    Serial.print("CAL_R "); Serial.print(n); Serial.print(" "); Serial.println(dr);
 
-    if(avg_left > 0 && avg_right > 0)
+    if(n >= SKIP)
     {
-      sensor_right_offset = avg_left - avg_right;
-      Serial.print("CAL_OFFSET_R "); Serial.println(sensor_right_offset);
-      Serial.println("Right sensor offset saved. Navigate mode will apply it automatically.");
-    }
-    else
-    {
-      Serial.println("CAL_ERROR: one or both sensors returned no valid readings.");
+      if(dl > 0) { sum_l += dl; valid_l++; }
+      if(dr > 0) { sum_r += dr; valid_r++; }
     }
 
-    mode = 0;
-    return;
+    delay(30);  // 30ms between pings — HC-SR04 needs ~60ms per sensor but we alternate L/R
   }
 
-  int dist_left  = read_ultrasonic(TRIG_LEFT,  ECHO_LEFT);
-  int dist_right = read_ultrasonic(TRIG_RIGHT, ECHO_RIGHT);
+  int avg_left  = (valid_l > 0) ? (int)(sum_l / valid_l) : -1;
+  int avg_right = (valid_r > 0) ? (int)(sum_r / valid_r) : -1;
 
-  if(dist_left  > 0) { cal_sum_left  += dist_left;  cal_valid_left++; }
-  if(dist_right > 0) { cal_sum_right += dist_right; cal_valid_right++; }
+  Serial.println("CAL_DONE");
+  Serial.print("CAL_AVG_L "); Serial.println(avg_left);
+  Serial.print("CAL_AVG_R "); Serial.println(avg_right);
 
-  Serial.print("CAL_L "); Serial.print(cal_count); Serial.print(" "); Serial.println(dist_left);
-  Serial.print("CAL_R "); Serial.print(cal_count); Serial.print(" "); Serial.println(dist_right);
+  if(avg_left > 0 && avg_right > 0)
+  {
+    sensor_right_offset = avg_left - avg_right;
+    Serial.print("CAL_OFFSET_R "); Serial.println(sensor_right_offset);
+    Serial.println("Right sensor offset saved. Navigate mode will apply it automatically.");
+  }
+  else
+  {
+    Serial.println("CAL_ERROR: one or both sensors returned no valid readings.");
+  }
 
-  cal_count++;
+  mode = 0;
 }
 
 // Returns distance in mm, or -1 on timeout (no echo within ~2.5m)
