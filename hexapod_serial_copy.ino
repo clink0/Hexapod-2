@@ -30,7 +30,8 @@
 //  CAPTURE      - Capture/lock current offsets (like L1/R1)
 //  CLEAR        - Clear all offsets and reset step height (like L2/R2)
 //  HOME         - Reset all legs to home position
-//  STATUS       - Print current mode, gait, speed, and joystick values
+//  STATUS       - Print current mode, gait, speed, joystick, and heading
+//  COMPASS      - Print current compass heading and locked target heading
 //
 // Example Python usage (pyserial):
 //   ser.write(b"MODE 1\n")          # enter walk mode
@@ -44,6 +45,9 @@
 //***********************************************************************
 #include <Servo.h>
 #include <math.h>
+#include <Wire.h>
+#include "ICM_20948.h"
+#include "MagCal.h"
 
 
 //***********************************************************************
@@ -55,6 +59,11 @@ const int TRIG_RIGHT = 2;             //HC-SR04 right sensor (front-right leg)
 const int ECHO_RIGHT = 3;
 const int TRIG_LEFT  = 4;             //HC-SR04 left sensor (front-left leg)
 const int ECHO_LEFT  = 5;
+
+const int SW_BIT0    = A3;            //mode switchboard: 3-bit binary input
+const int SW_BIT1    = A4;            //  A3=bit0 (LSB), A4=bit1, A5=bit2 (MSB)
+const int SW_BIT2    = A5;            //  LOW = switch closed (INPUT_PULLUP)
+const int SW_BUTTON  = A6;            //push-button trigger: press to latch switch state
 
 const int COXA1_SERVO  = 19;
 const int FEMUR1_SERVO = 8;
@@ -203,6 +212,21 @@ int tetrapod_case[6] = {1,3,2,1,2,3};     //for tetrapod gait
 
 
 //***********************************************************************
+// Compass / IMU
+//***********************************************************************
+ICM_20948_I2C myICM;
+bool  imu_ready      = false;
+MagCal magCal;
+float compass_target  = -1.0;  // -1 = not locked; 0-360 = target heading (degrees)
+float compass_sin_acc =  0.0;  // low-pass filter accumulators (sin/cos form handles wrap)
+float compass_cos_acc =  1.0;
+bool  compass_filter_init = false;
+
+// --- Mode switchboard ---
+int switch_pending_mode = -1;  // mode waiting to start after home countdown
+int switch_countdown    =  0;  // frames remaining in 2-second home pause
+
+//***********************************************************************
 // Object Declarations
 //***********************************************************************
 Servo coxa1_servo;      //18 servos
@@ -265,6 +289,12 @@ void setup()
   pinMode(TRIG_RIGHT, OUTPUT); pinMode(ECHO_RIGHT, INPUT);
   pinMode(TRIG_LEFT,  OUTPUT); pinMode(ECHO_LEFT,  INPUT);
 
+  //set up mode switchboard pins (internal pull-ups; LOW = switch closed)
+  pinMode(SW_BIT0,   INPUT_PULLUP);
+  pinMode(SW_BIT1,   INPUT_PULLUP);
+  pinMode(SW_BIT2,   INPUT_PULLUP);
+  pinMode(SW_BUTTON, INPUT_PULLUP);
+
   //set up battery monitor average array
   for(batt_voltage_index=0; batt_voltage_index<50; batt_voltage_index++)
     batt_voltage_array[batt_voltage_index] = 0;
@@ -288,6 +318,22 @@ void setup()
   reset_position = true;
   leg1_IK_control = true;
   leg6_IK_control = true;
+
+  //initialize ICM-20948 compass
+  Wire.begin();
+  Wire.setClock(400000);
+  myICM.begin(Wire, 1);   // AD0 high → 0x69; change to 0 for 0x68
+  if(myICM.status == ICM_20948_Stat_Ok) {
+    imu_ready = true;
+    if(magCalLoad(magCal)) {
+      Serial.println("Compass ready (calibration loaded from EEPROM).");
+    } else {
+      magCal.offsetX = 0; magCal.offsetY = 0; magCal.scaleX = 1; magCal.scaleY = 1;
+      Serial.println("Compass ready (NO calibration — run IMU_Calibrate.ino first).");
+    }
+  } else {
+    Serial.println("ICM-20948 not found — compass heading lock disabled.");
+  }
 }
 
 
@@ -303,6 +349,7 @@ void loop()
 
     //read and process any incoming serial commands
     process_serial();
+    process_switches();
 
     if(reset_position == true)
     {
@@ -351,6 +398,80 @@ void loop()
 
 
 //***********************************************************************
+// Mode Helpers
+//***********************************************************************
+
+// Shared mode-entry logic used by both serial commands and the switchboard.
+void apply_mode(int new_mode)
+{
+  mode = new_mode;
+  reset_position = true;
+  if(mode == 5) { scan_phase = 0; scan_tick = 0; }
+  if(mode == 6) {
+    auto_phase = 0; auto_timer = 0; scan_tick = 0; tick = 0;
+    auto_straight_streak = 0; auto_walk_ticks = 100;
+    auto_turn_dir = 0; auto_turn_ticks = 75; auto_turn_joy = 128;
+    memset(vfh_left,  0, sizeof(vfh_left));
+    memset(vfh_right, 0, sizeof(vfh_right));
+    int t[6] = {1,2,1,2,1,2}; memcpy(tripod_case, t, sizeof(t));
+  }
+  if(mode == 7) {
+    cal_count = 0;
+    Serial.println("CAL_START — place both sensors the same distance from a flat surface.");
+  }
+  if(mode == 1 && imu_ready) {
+    float h = read_compass_heading();
+    if(h >= 0) { compass_target = h; Serial.print("COMPASS_LOCK "); Serial.println(h, 1); }
+  }
+  if(mode == 6 && imu_ready) {
+    float h = read_compass_heading();
+    if(h >= 0) { compass_target = h; Serial.print("NAV_HEADING_LOCK "); Serial.println(h, 1); }
+  }
+  if(mode != 1 && mode != 6) compass_target = -1.0;
+}
+
+// Reads the 3 binary switches (A3/A4/A5) and returns mode 0-7.
+// Triggers on falling edge of the push-button (A6).
+// Holds home (mode 0) for 2 seconds, then enters the selected mode.
+void process_switches()
+{
+  static int button_prev = HIGH;
+  int button_now = digitalRead(SW_BUTTON);
+
+  // Falling edge = button pressed
+  if(button_prev == HIGH && button_now == LOW)
+  {
+    int sw = 0;
+    if(digitalRead(SW_BIT0) == LOW) sw |= 1;
+    if(digitalRead(SW_BIT1) == LOW) sw |= 2;
+    if(digitalRead(SW_BIT2) == LOW) sw |= 4;
+
+    switch_pending_mode = sw;
+    switch_countdown    = 100;   // 100 frames × 20ms = 2 seconds
+    // Go to home immediately and hold there during countdown
+    mode = 0;
+    reset_position = true;
+    joy_RX = 128; joy_RY = 128; joy_LX = 128; joy_LY = 128;
+    compass_target = -1.0;
+    Serial.print("SWITCH mode="); Serial.print(sw); Serial.println(" standing 2s...");
+  }
+  button_prev = button_now;
+
+  // Count down home-standing period
+  if(switch_countdown > 0)
+  {
+    mode = 0;            // prevent anything else from running during pause
+    switch_countdown--;
+    if(switch_countdown == 0)
+    {
+      Serial.print("SWITCH go mode="); Serial.println(switch_pending_mode);
+      apply_mode(switch_pending_mode);
+      switch_pending_mode = -1;
+    }
+  }
+}
+
+//***********************************************************************
 // Serial Processing
 //***********************************************************************
 void process_serial()
@@ -380,21 +501,7 @@ void parse_command(String cmd)
 
   if(cmd.startsWith("MODE"))
   {
-    mode = cmd.substring(5).toInt();
-    reset_position = true;
-    if(mode == 5) { scan_phase = 0; scan_tick = 0; }
-    if(mode == 6) {
-      auto_phase = 0; auto_timer = 0; scan_tick = 0; tick = 0;
-      auto_straight_streak = 0; auto_walk_ticks = 100;
-      auto_turn_dir = 0; auto_turn_ticks = 75; auto_turn_joy = 128;
-      memset(vfh_left,  0, sizeof(vfh_left));
-      memset(vfh_right, 0, sizeof(vfh_right));
-      int t[6] = {1,2,1,2,1,2}; memcpy(tripod_case, t, sizeof(t));
-    }
-    if(mode == 7) {
-      cal_count = 0;
-      Serial.println("CAL_START — place both sensors the same distance from a flat surface.");
-    }
+    apply_mode(cmd.substring(5).toInt());
     Serial.print("OK MODE "); Serial.println(mode);
   }
   else if(cmd.startsWith("GAIT"))
@@ -454,6 +561,18 @@ void parse_command(String cmd)
     Serial.print("Mode: "); Serial.println(mode);
     Serial.print("Gait: "); Serial.println(gait);
     Serial.print("Batt: "); Serial.println(float(batt_voltage)/100.0);
+    if(imu_ready) {
+      float h = read_compass_heading();
+      Serial.print("Heading: "); Serial.println(h, 1);
+      if(compass_target >= 0) { Serial.print("TargetHdg: "); Serial.println(compass_target, 1); }
+    }
+  }
+  else if(cmd == "COMPASS")
+  {
+    if(!imu_ready) { Serial.println("Compass not available."); return; }
+    float h = read_compass_heading();
+    Serial.print("HEADING "); Serial.println(h, 1);
+    if(compass_target >= 0) { Serial.print("TARGET  "); Serial.println(compass_target, 1); }
   }
 }
 
@@ -659,6 +778,37 @@ void tetrapod_gait()
 }
 
 //***********************************************************************
+// Compass Heading
+//***********************************************************************
+// Returns heading in degrees [0, 360), or -1 if IMU not ready.
+// Applies hard-iron/soft-iron calibration and a low-pass filter.
+// Uses sin/cos accumulation so the filter handles the 0°/360° wrap correctly.
+// ALPHA = 0.1 → ~130 ms time constant at 50 Hz (tune lower for more smoothing).
+float read_compass_heading()
+{
+  if(!imu_ready) return -1;
+  myICM.getAGMT();
+  float mx = (myICM.magX() - magCal.offsetX) * magCal.scaleX;
+  float my = (myICM.magY() - magCal.offsetY) * magCal.scaleY;
+
+  float raw_rad = atan2(my, mx);
+  const float ALPHA = 0.1f;
+
+  if(!compass_filter_init) {
+    compass_sin_acc   = sin(raw_rad);
+    compass_cos_acc   = cos(raw_rad);
+    compass_filter_init = true;
+  } else {
+    compass_sin_acc = ALPHA * sin(raw_rad) + (1.0f - ALPHA) * compass_sin_acc;
+    compass_cos_acc = ALPHA * cos(raw_rad) + (1.0f - ALPHA) * compass_cos_acc;
+  }
+
+  float heading = atan2(compass_sin_acc, compass_cos_acc) * RAD_TO_DEG;
+  if(heading < 0) heading += 360.0f;
+  return heading;
+}
+
+//***********************************************************************
 // Calculation Helpers
 //***********************************************************************
 void compute_strides()
@@ -666,6 +816,45 @@ void compute_strides()
   strideX = 90*commandedX/127;
   strideY = 90*commandedY/127;
   strideR = 35*commandedR/127;
+
+  // Compass heading lock: P-controller keeps robot on its locked heading.
+  if(imu_ready && compass_target >= 0)
+  {
+    float cur = read_compass_heading();
+    if(cur >= 0)
+    {
+      if(mode == 6)
+      {
+        // Auto-navigate: apply correction only while walking straight (phase 0/1).
+        // During obstacle-avoidance turns (phase 10) let the VFH steer freely.
+        // Never update compass_target — always try to return to the original heading.
+        if(auto_phase != 10)
+        {
+          float err = cur - compass_target;
+          if(err >  180) err -= 360;
+          if(err < -180) err += 360;
+          strideR = constrain(strideR - err * 0.15f, -35.0f, 35.0f);
+        }
+      }
+      else
+      {
+        // Manual walk (mode 1): track heading while user rotates, lock when released.
+        bool user_rotating = (abs(joy_LX - 128) > 20);
+        if(user_rotating)
+        {
+          compass_target = cur;
+        }
+        else
+        {
+          float err = cur - compass_target;
+          if(err >  180) err -= 360;
+          if(err < -180) err += 360;
+          strideR = constrain(strideR - err * 0.15f, -35.0f, 35.0f);
+        }
+      }
+    }
+  }
+
   sinRotZ = sin(radians(strideR));
   cosRotZ = cos(radians(strideR));
   duration = (gait_speed == 2) ? 720 : (gait_speed == 0) ? 1080 : 3240;
@@ -900,6 +1089,14 @@ void auto_navigate()
     //--- VFH-lite: build polar histogram, pick clearest direction ----
     case 8:
       {
+        // --- Raw scan data dump ---
+        Serial.print("RAW_L mm:");
+        for(int i = 0; i < 7; i++) { Serial.print(" "); Serial.print(vfh_left[i]); }
+        Serial.println();
+        Serial.print("RAW_R mm:");
+        for(int i = 0; i < 7; i++) { Serial.print(" "); Serial.print(vfh_right[i]); }
+        Serial.println();
+
         // Polar certainty histogram: 13 slots, 15° each, covering -90° to +90°
         // slot 0=-90°(hard left) ... slot 6=0°(forward) ... slot 12=+90°(hard right)
         // vfh_left[i]:  i=0→90°L(slot 0), i=1→75°L(slot 1), ..., i=6→0°(slot 6)
@@ -908,16 +1105,25 @@ void auto_navigate()
         float hist[13];
         for(int i = 0; i < 13; i++) hist[i] = 0.0;
 
+        // --- Build histogram and print cert values slot by slot ---
+        Serial.println("CERT  slot  dist_L  cert_L  dist_R  cert_R");
         for(int i = 0; i < 7; i++) {
           float cert_l = (vfh_left[i]  > 0 && vfh_left[i]  < AUTO_OBSTACLE_MM) ?
                           (float)(AUTO_OBSTACLE_MM - vfh_left[i])  / AUTO_OBSTACLE_MM : 0.0;
           float cert_r = (vfh_right[i] > 0 && vfh_right[i] < AUTO_OBSTACLE_MM) ?
                           (float)(AUTO_OBSTACLE_MM - vfh_right[i]) / AUTO_OBSTACLE_MM : 0.0;
+
+          Serial.print("CERT  i="); Serial.print(i);
+          Serial.print("  L="); Serial.print(vfh_left[i]);
+          Serial.print(" cL="); Serial.print(int(cert_l * 100));
+          Serial.print("  R="); Serial.print(vfh_right[i]);
+          Serial.print(" cR="); Serial.println(int(cert_r * 100));
+
           if(i == 6) {
             hist[6] = (cert_l + cert_r) / 2.0;     // forward: average both sensors
           } else {
-            hist[6 - i] = cert_l;                   // left side:  slots 5,4,3,2,1,0
-            hist[6 + i] = cert_r;                   // right side: slots 7,8,9,10,11,12
+            hist[i]      = cert_l;                  // left side:  slots 0,1,2,3,4,5
+            hist[12 - i] = cert_r;                  // right side: slots 12,11,10,9,8,7
           }
         }
 
@@ -955,11 +1161,22 @@ void auto_navigate()
         }
 
         // Print histogram (as 0-100 integers) and decision
-        Serial.print("VFH:");
-        for(int i = 0; i < 13; i++) { Serial.print(" "); Serial.print(int(hist[i] * 100)); }
-        Serial.print(" | best="); Serial.print(best_angle_deg); Serial.print("deg dir=");
+        // Format: L=left side, [FWD], R=right side
+        Serial.print("HIST L[");
+        for(int i = 0; i <= 5; i++) { Serial.print(int(hist[i]*100)); if(i<5) Serial.print(","); }
+        Serial.print("] FWD["); Serial.print(int(hist[6]*100));
+        Serial.print("] R[");
+        for(int i = 7; i <= 12; i++) { Serial.print(int(hist[i]*100)); if(i<12) Serial.print(","); }
+        Serial.println("]");
+
+        Serial.print("DECIDE best=slot"); Serial.print(best_slot);
+        Serial.print("("); Serial.print(best_angle_deg); Serial.print("deg)");
+        Serial.print(" dir=");
         Serial.print(auto_turn_dir == 0 ? "STRAIGHT" : (auto_turn_dir == -1 ? "LEFT" : "RIGHT"));
-        if(auto_turn_dir != 0) { Serial.print(" ticks="); Serial.print(auto_turn_ticks); }
+        if(auto_turn_dir != 0) {
+          Serial.print(" joy_LX="); Serial.print(auto_turn_joy);
+          Serial.print(" ticks="); Serial.print(auto_turn_ticks);
+        }
         Serial.print(" streak="); Serial.print(auto_straight_streak);
         Serial.print(" nextWalk="); Serial.print(auto_walk_ticks * FRAME_TIME_MS / 1000.0, 1);
         Serial.println("s");
