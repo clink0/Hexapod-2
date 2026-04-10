@@ -63,7 +63,7 @@ const int ECHO_LEFT  = 5;
 const int SW_BIT0    = A3;            //mode switchboard: 3-bit binary input
 const int SW_BIT1    = A4;            //  A3=bit0 (LSB), A4=bit1, A5=bit2 (MSB)
 const int SW_BIT2    = A5;            //  LOW = switch closed (INPUT_PULLUP)
-const int SW_BUTTON  = A6;            //push-button trigger: press to latch switch state
+const int SW_BUTTON  = A2;            //push-button trigger (A6/A7 are analog-only on Mega; use A0-A5)
 
 const int COXA1_SERVO  = 19;
 const int FEMUR1_SERVO = 8;
@@ -441,26 +441,39 @@ void process_switches()
   // Falling edge = button pressed
   if(button_prev == HIGH && button_now == LOW)
   {
+    // Read each pin and show its raw state so wiring can be verified
+    int b0 = digitalRead(SW_BIT0);   // A3
+    int b1 = digitalRead(SW_BIT1);   // A4
+    int b2 = digitalRead(SW_BIT2);   // A5
+
+    Serial.print("SWITCH_PINS A3="); Serial.print(b0);
+    Serial.print(" A4="); Serial.print(b1);
+    Serial.print(" A5="); Serial.println(b2);
+
+    // Build mode: open (HIGH=1) → bit is 1, GND (LOW=0) → bit is 0
+    // This reads the pin value directly as the binary digit.
     int sw = 0;
-    if(digitalRead(SW_BIT0) == LOW) sw |= 1;
-    if(digitalRead(SW_BIT1) == LOW) sw |= 2;
-    if(digitalRead(SW_BIT2) == LOW) sw |= 4;
+    if(b0 == HIGH) sw |= 1;   // A3 open = bit 0 set
+    if(b1 == HIGH) sw |= 2;   // A4 open = bit 1 set
+    if(b2 == HIGH) sw |= 4;   // A5 open = bit 2 set
+
+    Serial.print("SWITCH mode="); Serial.print(sw);
+    Serial.print(" (binary "); Serial.print(b2); Serial.print(b1); Serial.print(b0);
+    Serial.println(") standing 2s...");
 
     switch_pending_mode = sw;
     switch_countdown    = 100;   // 100 frames × 20ms = 2 seconds
-    // Go to home immediately and hold there during countdown
     mode = 0;
     reset_position = true;
     joy_RX = 128; joy_RY = 128; joy_LX = 128; joy_LY = 128;
     compass_target = -1.0;
-    Serial.print("SWITCH mode="); Serial.print(sw); Serial.println(" standing 2s...");
   }
   button_prev = button_now;
 
   // Count down home-standing period
   if(switch_countdown > 0)
   {
-    mode = 0;            // prevent anything else from running during pause
+    mode = 0;
     switch_countdown--;
     if(switch_countdown == 0)
     {
@@ -986,6 +999,7 @@ void auto_navigate()
   const int   MAX_TURN_TICKS    = 150;  // longest turn (~3s, obstacle very close)
   const int   MIN_JOY_OFFSET    = 28;   // gentlest rotation (obstacle near threshold)
   const int   MAX_JOY_OFFSET    = 88;   // sharpest rotation (obstacle very close, ~100mm)
+  const float NAV_WALK_Z_OFFSET = 20.0; // extra body height (mm) during navigate walking for obstacle clearance
 
   float alpha, sweep_angle;
   int   dist;
@@ -997,6 +1011,7 @@ void auto_navigate()
       joy_RY = 50; joy_RX = 128; joy_LX = 128;  // joy_RY=50 → near-max stride (~50mm)
       gait_speed = 2;                             // sprint: 720ms cycle vs normal 1080ms
       tripod_gait();
+      for(int ln=0; ln<6; ln++) current_Z[ln] += NAV_WALK_Z_OFFSET;
       if(++auto_timer >= auto_walk_ticks) { auto_timer = 0; auto_phase = 1; }
       break;
 
@@ -1005,6 +1020,7 @@ void auto_navigate()
       joy_RY = 128; joy_RX = 128; joy_LX = 128;
       gait_speed = 0;                             // restore normal speed for wave gait turns
       tripod_gait();
+      for(int ln=0; ln<6; ln++) current_Z[ln] += NAV_WALK_Z_OFFSET;
       if(tick == 0)
       {
         reset_position = true;
@@ -1054,8 +1070,8 @@ void auto_navigate()
     case 5:  // lift right leg to sweep start
       for(int ln=0; ln<6; ln++) { current_X[ln]=HOME_X[ln]; current_Y[ln]=HOME_Y[ln]; current_Z[ln]=SCAN_STANCE_Z; }
       alpha        = (float)scan_tick / SCAN_LIFT_TICKS;
-      current_X[0] = HOME_X[0]     + alpha * (SCAN_RADIUS   - HOME_X[0]);
-      current_Y[0] = HOME_Y[0]     + alpha * (0.0           - HOME_Y[0]);
+      current_X[0] = HOME_X[0]     + alpha * (0.0           - HOME_X[0]);
+      current_Y[0] = HOME_Y[0]     + alpha * (SCAN_RADIUS   - HOME_Y[0]);
       current_Z[0] = SCAN_STANCE_Z + alpha * (SCAN_RAISED_Z - SCAN_STANCE_Z);
       if(scan_tick >= SCAN_LIFT_TICKS-1) { scan_tick=0; auto_phase=6; } else scan_tick++;
       break;
@@ -1080,8 +1096,8 @@ void auto_navigate()
     case 7:  // lower right leg back to tall stance
       for(int ln=1; ln<6; ln++) { current_X[ln]=HOME_X[ln]; current_Y[ln]=HOME_Y[ln]; current_Z[ln]=SCAN_STANCE_Z; }
       alpha        = (float)scan_tick / SCAN_LIFT_TICKS;
-      current_X[0] = 0.0          + alpha * (HOME_X[0] - 0.0);
-      current_Y[0] = SCAN_RADIUS  + alpha * (HOME_Y[0] - SCAN_RADIUS);
+      current_X[0] = SCAN_RADIUS  + alpha * (HOME_X[0] - SCAN_RADIUS);
+      current_Y[0] = 0.0          + alpha * (HOME_Y[0] - 0.0);
       current_Z[0] = SCAN_RAISED_Z + alpha * (SCAN_STANCE_Z - SCAN_RAISED_Z);
       if(scan_tick >= SCAN_LIFT_TICKS-1) { scan_tick=0; auto_timer=0; auto_phase=8; } else scan_tick++;
       break;
@@ -1157,7 +1173,7 @@ void auto_navigate()
           int abs_angle = constrain(abs(best_angle_deg), 15, 90);
           auto_turn_ticks = map(abs_angle, 15, 90, MIN_TURN_TICKS, MAX_TURN_TICKS);
           int joy_offset  = map(abs_angle, 15, 90, MIN_JOY_OFFSET, MAX_JOY_OFFSET);
-          auto_turn_joy   = (auto_turn_dir == -1) ? (128 - joy_offset) : (128 + joy_offset);
+          auto_turn_joy   = (auto_turn_dir == -1) ? (128 + joy_offset) : (128 - joy_offset);
         }
 
         // Print histogram (as 0-100 integers) and decision
@@ -1193,7 +1209,7 @@ void auto_navigate()
         for(int ln=0; ln<6; ln++) {
           current_X[ln] = HOME_X[ln];
           current_Y[ln] = HOME_Y[ln];
-          current_Z[ln] = SCAN_STANCE_Z + alpha * (HOME_Z[ln] - SCAN_STANCE_Z);
+          current_Z[ln] = SCAN_STANCE_Z + alpha * ((HOME_Z[ln] + NAV_WALK_Z_OFFSET) - SCAN_STANCE_Z);
         }
         if(++auto_timer >= SCAN_LIFT_TICKS) {
           reset_position = true;
@@ -1216,6 +1232,7 @@ void auto_navigate()
       joy_RX = 128;
       joy_LX = auto_turn_joy;
       wave_gait();
+      for(int ln=0; ln<6; ln++) current_Z[ln] += NAV_WALK_Z_OFFSET;
       if(++auto_timer >= auto_turn_ticks) {
         joy_LX = 128; joy_RY = 128;
         auto_timer = 0;
@@ -1321,10 +1338,10 @@ void scan_mode()
 
   switch(scan_phase)
   {
-    case 0:  // lift right leg (leg 0) from tall stance to right-side sweep start (X+, Y=0)
+    case 0:  // lift right leg (leg 0) from tall stance to right-side sweep start (X=0, Y=RADIUS)
       alpha = (float)scan_tick / SCAN_LIFT_TICKS;
-      current_X[0] = HOME_X[0]  + alpha * (SCAN_RADIUS   - HOME_X[0]);
-      current_Y[0] = HOME_Y[0]  + alpha * (0.0           - HOME_Y[0]);
+      current_X[0] = HOME_X[0]  + alpha * (0.0           - HOME_X[0]);
+      current_Y[0] = HOME_Y[0]  + alpha * (SCAN_RADIUS   - HOME_Y[0]);
       current_Z[0] = SCAN_STANCE_Z + alpha * (SCAN_RAISED_Z - SCAN_STANCE_Z);
       if(scan_tick >= SCAN_LIFT_TICKS - 1) { scan_tick = 0; scan_phase = 1; }
       else scan_tick++;
@@ -1349,8 +1366,8 @@ void scan_mode()
 
     case 2:  // lower right leg from sweep end back to tall stance position
       alpha = (float)scan_tick / SCAN_LIFT_TICKS;
-      current_X[0] = 0.0         + alpha * (HOME_X[0] - 0.0);
-      current_Y[0] = SCAN_RADIUS + alpha * (HOME_Y[0] - SCAN_RADIUS);
+      current_X[0] = SCAN_RADIUS  + alpha * (HOME_X[0] - SCAN_RADIUS);
+      current_Y[0] = 0.0          + alpha * (HOME_Y[0] - 0.0);
       current_Z[0] = SCAN_RAISED_Z + alpha * (SCAN_STANCE_Z - SCAN_RAISED_Z);
       if(scan_tick >= SCAN_LIFT_TICKS - 1) { scan_tick = 0; scan_phase = 3; }
       else scan_tick++;
