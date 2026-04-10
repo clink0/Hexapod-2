@@ -1011,7 +1011,7 @@ void auto_navigate()
       joy_RY = 50; joy_RX = 128; joy_LX = 128;  // joy_RY=50 → near-max stride (~50mm)
       gait_speed = 2;                             // sprint: 720ms cycle vs normal 1080ms
       tripod_gait();
-      for(int ln=0; ln<6; ln++) current_Z[ln] += NAV_WALK_Z_OFFSET;
+      for(int ln=0; ln<6; ln++) current_Z[ln] -= NAV_WALK_Z_OFFSET;
       if(++auto_timer >= auto_walk_ticks) { auto_timer = 0; auto_phase = 1; }
       break;
 
@@ -1020,7 +1020,7 @@ void auto_navigate()
       joy_RY = 128; joy_RX = 128; joy_LX = 128;
       gait_speed = 0;                             // restore normal speed for wave gait turns
       tripod_gait();
-      for(int ln=0; ln<6; ln++) current_Z[ln] += NAV_WALK_Z_OFFSET;
+      for(int ln=0; ln<6; ln++) current_Z[ln] -= NAV_WALK_Z_OFFSET;
       if(tick == 0)
       {
         reset_position = true;
@@ -1209,7 +1209,7 @@ void auto_navigate()
         for(int ln=0; ln<6; ln++) {
           current_X[ln] = HOME_X[ln];
           current_Y[ln] = HOME_Y[ln];
-          current_Z[ln] = SCAN_STANCE_Z + alpha * ((HOME_Z[ln] + NAV_WALK_Z_OFFSET) - SCAN_STANCE_Z);
+          current_Z[ln] = SCAN_STANCE_Z + alpha * ((HOME_Z[ln] - NAV_WALK_Z_OFFSET) - SCAN_STANCE_Z);
         }
         if(++auto_timer >= SCAN_LIFT_TICKS) {
           reset_position = true;
@@ -1232,7 +1232,7 @@ void auto_navigate()
       joy_RX = 128;
       joy_LX = auto_turn_joy;
       wave_gait();
-      for(int ln=0; ln<6; ln++) current_Z[ln] += NAV_WALK_Z_OFFSET;
+      for(int ln=0; ln<6; ln++) current_Z[ln] -= NAV_WALK_Z_OFFSET;
       if(++auto_timer >= auto_turn_ticks) {
         joy_LX = 128; joy_RY = 128;
         auto_timer = 0;
