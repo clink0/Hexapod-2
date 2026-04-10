@@ -1173,7 +1173,7 @@ void auto_navigate()
           int abs_angle = constrain(abs(best_angle_deg), 15, 90);
           auto_turn_ticks = map(abs_angle, 15, 90, MIN_TURN_TICKS, MAX_TURN_TICKS);
           int joy_offset  = map(abs_angle, 15, 90, MIN_JOY_OFFSET, MAX_JOY_OFFSET);
-          auto_turn_joy   = (auto_turn_dir == -1) ? (128 + joy_offset) : (128 - joy_offset);
+          auto_turn_joy   = (auto_turn_dir == -1) ? (128 - joy_offset) : (128 + joy_offset);
         }
 
         // Print histogram (as 0-100 integers) and decision
